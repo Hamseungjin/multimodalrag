@@ -1,0 +1,41 @@
+# FastAPI 및 웹 서버
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+
+# Streamlit 프론트엔드
+streamlit==1.28.1
+streamlit-chat==0.1.1
+
+# ML/AI 모델 관련 (멀티 GPU 최적화)
+torch==2.1.0
+transformers==4.51.3
+sentence-transformers==4.1.0
+accelerate==0.24.1
+flash-attn==2.6.3
+
+# 벡터 데이터베이스
+qdrant-client==1.6.9
+
+# 데이터 처리 및 수치 계산
+pandas==2.1.3
+numpy==1.26.4
+scikit-learn==1.7.0
+scipy==1.16.0
+markdown==3.5.1
+
+# 한국어 형태소 분석
+kiwipiepy==0.18.0
+
+
+# 유틸리티
+requests==2.31.0
+tqdm==4.66.1
+pydantic==2.5.0
+python-dotenv==1.0.0
+loguru==0.7.2
+psutil==7.0.0
+
+# 패키징 및 빌드
+packaging==23.2
+ninja==1.11.1
