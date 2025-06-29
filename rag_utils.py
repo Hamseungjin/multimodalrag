@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+import hashlib
+import time
 
 import torch
 import numpy as np
@@ -22,6 +24,20 @@ from sklearn.metrics.pairwise import cosine_similarity
 import re
 import time
 
+# 새로운 적응형 컴포넌트들 import
+from adaptive_rag_components import (
+    AdaptiveKeywordExtractor,
+    AdaptiveWeightCalculator, 
+    SmartThresholdCalculator,
+    FlyWheelMetricsCollector,
+    DomainDetector
+)
+
+# 캐싱을 위한 간단한 메모리 캐시 (Redis 대신 임시로 사용)
+KEYWORD_CACHE = {}
+DOMAIN_KEYWORDS_CACHE = {}
+MAX_CACHE_SIZE = 1000
+
 @dataclass
 class Document:
     """문서 데이터 클래스"""
@@ -30,479 +46,7 @@ class Document:
     doc_id: str
     doc_type: str  # "text" or "image"
 
-class EmbeddingModel:
-    """임베딩 모델 클래스"""
-    
-    def __init__(self, model_name: str = Config.EMBEDDING_MODEL):
-        self.model_name = model_name
-        self.model = None
-        self._load_model()
-    
-    def _load_model(self):
-        """임베딩 모델을 로드합니다."""
-        try:
-            logger.info(f"임베딩 모델 로딩 중: {self.model_name}")
-            self.model = SentenceTransformer(self.model_name)
-            if torch.cuda.is_available():
-                self.model = self.model.to('cuda')
-            logger.info("임베딩 모델 로딩 완료")
-        except Exception as e:
-            logger.error(f"임베딩 모델 로딩 실패: {e}")
-            raise
-    
-    def encode(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
-        """텍스트를 임베딩으로 변환합니다."""
-        try:
-            embeddings = self.model.encode(
-                texts,
-                batch_size=batch_size,
-                show_progress_bar=True,
-                convert_to_numpy=True,
-                normalize_embeddings=True
-            )
-            return embeddings
-        except Exception as e:
-            logger.error(f"임베딩 생성 실패: {e}")
-            raise
-
-class RerankerModel:
-    """리랭커 모델 클래스"""
-    
-    def __init__(self, model_name: str = Config.RERANKER_MODEL):
-        self.model_name = model_name
-        self.model = None
-        self._load_model()
-    
-    def _load_model(self):
-        """리랭커 모델을 로드합니다."""
-        try:
-            logger.info(f"리랭커 모델 로딩 중: {self.model_name}")
-            self.model = SentenceTransformer(self.model_name)
-            if torch.cuda.is_available():
-                self.model = self.model.to('cuda')
-            logger.info("리랭커 모델 로딩 완료")
-        except Exception as e:
-            logger.error(f"리랭커 모델 로딩 실패: {e}")
-            raise
-    
-    def rerank(self, query: str, documents: List[str], top_k: int = 5) -> List[Tuple[int, float]]:
-        """쿼리와 문서들의 관련성을 재평가합니다."""
-        try:
-            if not documents:
-                return []
-            
-            # SentenceTransformer의 similarity 기능 사용
-            query_embedding = self.model.encode([query], convert_to_tensor=True)
-            doc_embeddings = self.model.encode(documents, convert_to_tensor=True)
-            
-            # 코사인 유사도 계산
-            from sentence_transformers.util import cos_sim
-            similarities = cos_sim(query_embedding, doc_embeddings)[0]
-            
-            # 텐서를 numpy로 변환
-            if hasattr(similarities, 'cpu'):
-                similarities = similarities.cpu().numpy()
-            else:
-                similarities = np.array(similarities)
-            
-            # 점수와 인덱스를 함께 정렬
-            scored_docs = [(i, float(score)) for i, score in enumerate(similarities)]
-            scored_docs.sort(key=lambda x: x[1], reverse=True)
-            
-            return scored_docs[:top_k]
-            
-        except Exception as e:
-            logger.error(f"리랭킹 실패: {e}")
-            # 원본 순서 유지하면서 기본 점수 할당
-            return [(i, 1.0 - (i * 0.1)) for i in range(min(top_k, len(documents)))]
-
-class AdvancedKeywordExtractor:
-    """고급 키워드 추출기 - KiwiPiepy + BGE-m3-ko + TF-IDF (의미적 유사도 보정 추가)"""
-    
-    def __init__(self, embedding_model: EmbeddingModel):
-        self.embedding_model = embedding_model
-        self.kiwi = Kiwi()
-        self.tfidf = TfidfVectorizer(max_features=100, ngram_range=(1, 3))
-        
-        # 경제/금융 도메인 시드 키워드 (의미적 확장의 기준점)
-        self.seed_keywords = {
-            "물가": ["소비자물가", "CPI", "인플레이션", "물가상승률", "디플레이션", "PCE"],
-            "고용": ["고용", "실업", "일자리", "취업", "실업률", "고용률", "비농업부문", "임금"],
-            "금융": ["금리", "기준금리", "FOMC", "연준", "통화정책", "양적완화", "QE", "QT"],
-            "시장": ["금융시장", "주식", "채권", "시장반응", "증시", "달러", "환율"],
-            "경제": ["경제", "성장", "GDP", "경기", "경제지표", "무역", "수출", "수입", "경기침체"],
-            "수치": ["상승", "하락", "증가", "감소", "개선", "악화", "안정", "둔화", "가속화"]
-        }
-        
-        # 모든 시드 키워드들의 임베딩 미리 계산
-        self.seed_embeddings = self._compute_seed_embeddings()
-    
-    def _compute_seed_embeddings(self) -> Dict[str, np.ndarray]:
-        """시드 키워드들의 임베딩을 미리 계산합니다."""
-        seed_embeddings = {}
-        for category, keywords in self.seed_keywords.items():
-            embeddings = self.embedding_model.encode(keywords)
-            seed_embeddings[category] = embeddings
-        return seed_embeddings
-    
-    def extract_keywords(self, query: str, context_texts: List[str] = None) -> Dict[str, Any]:
-        """
-        고급 키워드 추출을 수행합니다.
-        
-        Returns:
-            {
-                "morphological_keywords": List[str],  # 형태소 분석 결과
-                "semantic_keywords": List[str],       # 의미적 확장 키워드
-                "tfidf_keywords": List[str],         # TF-IDF 기반 중요 단어
-                "final_keywords": List[str],         # 최종 통합 키워드
-                "sentences": List[str],              # 정확한 문장 분리 결과
-                "analysis": Dict[str, Any]           # 분석 상세 정보
-            }
-        """
-        result = {
-            "morphological_keywords": [],
-            "semantic_keywords": [],
-            "tfidf_keywords": [],
-            "final_keywords": [],
-            "sentences": [],
-            "analysis": {}
-        }
-        
-        # 1. 형태소 분석 기반 키워드 추출
-        morph_keywords = self._extract_morphological_keywords(query)
-        result["morphological_keywords"] = morph_keywords
-        
-        # 2. 의미적 유사도 기반 키워드 확장
-        semantic_keywords = self._expand_keywords_semantically(query, morph_keywords)
-        result["semantic_keywords"] = semantic_keywords
-        
-        # 3. TF-IDF 기반 중요 단어 추출 (컨텍스트가 있는 경우)
-        if context_texts:
-            tfidf_keywords = self._extract_tfidf_keywords(query, context_texts)
-            result["tfidf_keywords"] = tfidf_keywords
-        
-        # 4. 문장 분리 (형태소 분석기 활용)
-        sentences = self._split_sentences_accurately(query)
-        result["sentences"] = sentences
-        
-        # 5. 최종 키워드 통합 및 중요도 계산
-        final_keywords = self._integrate_keywords(
-            morph_keywords, semantic_keywords, result["tfidf_keywords"]
-        )
-        result["final_keywords"] = final_keywords
-        
-        # 6. 분석 정보 추가
-        result["analysis"] = {
-            "total_keywords": len(final_keywords),
-            "morphological_count": len(morph_keywords),
-            "semantic_count": len(semantic_keywords),
-            "tfidf_count": len(result["tfidf_keywords"]),
-            "dominant_categories": self._categorize_keywords(final_keywords)
-        }
-        
-        return result
-    
-    def _extract_morphological_keywords(self, text: str) -> List[str]:
-        """형태소 분석을 통한 키워드 추출"""
-        keywords = []
-        
-        try:
-            # Kiwi 형태소 분석 - 최신 API 사용
-            # Method 1: morphs와 pos 메서드 사용 (안전한 방법)
-            try:
-                morphs = self.kiwi.morphs(text)
-                pos_tags = self.kiwi.pos(text)
-                
-                for word, tag in pos_tags:
-                    # 명사(N), 형용사(V), 영어(SL) 추출
-                    if (tag.startswith('N') or tag.startswith('V') or tag == 'SL') and len(word) >= 2:
-                        # 불용어 제거
-                        if word not in ['것', '이것', '그것', '저것', '때문', '때문에', '따라', '위해']:
-                            keywords.append(word)
-            
-            except (AttributeError, TypeError):
-                # Method 2: analyze 메서드 호환성 처리
-                try:
-                    analyzed = self.kiwi.analyze(text)
-                    
-                    for sentence in analyzed:
-                        # sentence가 리스트인지 확인
-                        if isinstance(sentence, list):
-                            tokens = sentence
-                        else:
-                            # sentence가 객체라면 tokens 속성 접근
-                            tokens = getattr(sentence, 'tokens', sentence)
-                        
-                        for token in tokens:
-                            # token이 리스트인 경우 처리
-                            if isinstance(token, list):
-                                # 각 요소가 실제 토큰인지 확인
-                                for sub_token in token:
-                                    word = getattr(sub_token, 'form', str(sub_token))
-                                    tag = getattr(sub_token, 'tag', 'UNKNOWN')
-                                    
-                                    if (tag.startswith('N') or tag.startswith('V') or tag == 'SL') and len(word) >= 2:
-                                        if word not in ['것', '이것', '그것', '저것', '때문', '때문에', '따라', '위해']:
-                                            keywords.append(word)
-                            else:
-                                # 일반적인 토큰 객체 처리
-                                word = getattr(token, 'form', str(token))
-                                tag = getattr(token, 'tag', 'UNKNOWN')
-                                
-                                if (tag.startswith('N') or tag.startswith('V') or tag == 'SL') and len(word) >= 2:
-                                    if word not in ['것', '이것', '그것', '저것', '때문', '때문에', '따라', '위해']:
-                                        keywords.append(word)
-                
-                except Exception as analyze_error:
-                    logger.warning(f"Kiwi analyze 메서드 실패: {analyze_error}")
-                    # Method 3: 기본 정규식 기반 키워드 추출로 폴백
-                    return self._extract_keywords_with_regex(text)
-        
-        except Exception as e:
-            logger.error(f"형태소 분석 실패: {e}")
-            # 형태소 분석 실패 시 기본 정규식 방법으로 폴백
-            return self._extract_keywords_with_regex(text)
-        
-        # 복합어 및 연속된 명사 추출
-        compound_keywords = self._extract_compound_words(text)
-        keywords.extend(compound_keywords)
-        
-        return list(set(keywords))  # 중복 제거
-    
-    def _extract_keywords_with_regex(self, text: str) -> List[str]:
-        """정규식 기반 키워드 추출 (형태소 분석 실패 시 폴백)"""
-        keywords = []
-        
-        # 한글 키워드 패턴
-        korean_patterns = [
-            r'[가-힣]{2,}지수',      # ~지수
-            r'[가-힣]{2,}물가',      # ~물가  
-            r'[가-힣]{2,}상승률',    # ~상승률
-            r'[가-힣]{2,}하락률',    # ~하락률
-            r'[가-힣]{2,}정책',      # ~정책
-            r'[가-힣]{2,}시장',      # ~시장
-            r'[가-힣]{2,}고용',      # ~고용
-            r'[가-힣]{2,}율',        # ~율 (실업률, 성장률 등)
-            r'[가-힣]{3,}',          # 3글자 이상 한글
-        ]
-        
-        # 영어/약어 패턴
-        english_patterns = [
-            r'\b[A-Z]{2,}\b',        # CPI, GDP, FOMC 등
-            r'\b[A-Z][a-z]+\b',      # Fed 등
-        ]
-        
-        all_patterns = korean_patterns + english_patterns
-        
-        for pattern in all_patterns:
-            matches = re.findall(pattern, text)
-            keywords.extend(matches)
-        
-        # 불용어 제거
-        filtered_keywords = []
-        stopwords = ['것', '이것', '그것', '저것', '때문', '때문에', '따라', '위해', '그런', '이런', '저런']
-        
-        for keyword in keywords:
-            if keyword not in stopwords and len(keyword.strip()) >= 2:
-                filtered_keywords.append(keyword.strip())
-        
-        return list(set(filtered_keywords))  # 중복 제거
-    
-    def _extract_compound_words(self, text: str) -> List[str]:
-        """복합어 및 연속된 명사 추출"""
-        compound_words = []
-        
-        # 정규식으로 복합어 패턴 찾기
-        patterns = [
-            r'[가-힣]+지수',  # ~지수
-            r'[가-힣]+계출지수',  # ~계출지수
-            r'[가-힣]+물가',  # ~물가
-            r'[가-힣]+상승률',  # ~상승률
-            r'[가-힣]+고용',  # ~고용
-            r'[가-힣]{2,}율',  # ~율 (실업률, 성장률 등)
-            r'[A-Z]{2,}',  # 영어 약어 (CPI, GDP 등)
-            r'[가-힣]+시장',  # ~시장
-            r'[가-힣]+정책',  # ~정책
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            compound_words.extend(matches)
-        
-        return compound_words
-    
-    def _expand_keywords_semantically(self, query: str, base_keywords: List[str]) -> List[str]:
-        """의미적 유사도를 기반으로 키워드 확장"""
-        if not base_keywords:
-            return []
-        
-        expanded_keywords = []
-        
-        # 쿼리 전체의 임베딩
-        query_embedding = self.embedding_model.encode([query])
-        
-        # 각 시드 카테고리와의 유사도 계산
-        for category, seed_embeddings in self.seed_embeddings.items():
-            similarities = cosine_similarity(query_embedding, seed_embeddings)[0]
-            
-            # 유사도가 0.5 이상인 키워드들 추가
-            for i, similarity in enumerate(similarities):
-                if similarity > 0.5:
-                    keyword = self.seed_keywords[category][i]
-                    if keyword not in base_keywords:
-                        expanded_keywords.append(keyword)
-        
-        # 기존 키워드들을 기반으로 한 확장
-        if base_keywords:
-            keyword_embeddings = self.embedding_model.encode(base_keywords)
-            
-            for category, seed_embeddings in self.seed_embeddings.items():
-                for keyword_emb in keyword_embeddings:
-                    similarities = cosine_similarity([keyword_emb], seed_embeddings)[0]
-                    
-                    for i, similarity in enumerate(similarities):
-                        if similarity > 0.6:  # 더 높은 임계값
-                            keyword = self.seed_keywords[category][i]
-                            if keyword not in base_keywords and keyword not in expanded_keywords:
-                                expanded_keywords.append(keyword)
-        
-        return expanded_keywords[:10]  # 최대 10개로 제한
-    
-    def _extract_tfidf_keywords(self, query: str, context_texts: List[str]) -> List[str]:
-        """TF-IDF 기반 중요 단어 추출"""
-        if not context_texts:
-            return []
-        
-        try:
-            # 모든 텍스트 (쿼리 + 컨텍스트) 결합
-            all_texts = [query] + context_texts
-            
-            # TF-IDF 벡터화
-            tfidf_matrix = self.tfidf.fit_transform(all_texts)
-            feature_names = self.tfidf.get_feature_names_out()
-            
-            # 쿼리(첫 번째 문서)의 TF-IDF 점수 
-            query_tfidf = tfidf_matrix[0].toarray()[0]
-            
-            # 점수가 높은 순으로 정렬
-            word_scores = [(feature_names[i], score) for i, score in enumerate(query_tfidf) if score > 0]
-            word_scores.sort(key=lambda x: x[1], reverse=True)
-            
-            # 상위 키워드 반환 (한글 키워드만)
-            tfidf_keywords = []
-            for word, score in word_scores[:15]:
-                if any(ord('가') <= ord(char) <= ord('힣') for char in word) or word.isupper():
-                    tfidf_keywords.append(word)
-            
-            return tfidf_keywords[:8]  # 최대 8개
-            
-        except Exception as e:
-            logger.warning(f"TF-IDF 키워드 추출 실패: {e}")
-            return []
-    
-    def _split_sentences_accurately(self, text: str) -> List[str]:
-        """정확한 문장 분리 (형태소 분석기 활용)"""
-        sentences = []
-        
-        # Kiwi의 문장 분리 기능 사용
-        try:
-            # Method 1: split_into_sents 메서드 시도
-            try:
-                split_result = self.kiwi.split_into_sents(text)
-                # split_result의 구조에 따라 처리
-                if hasattr(split_result, '__iter__'):
-                    for sent in split_result:
-                        if hasattr(sent, 'text'):
-                            sentences.append(sent.text.strip())
-                        elif isinstance(sent, str):
-                            sentences.append(sent.strip())
-                        else:
-                            sentences.append(str(sent).strip())
-                else:
-                    sentences = [str(split_result).strip()]
-            
-            except (AttributeError, TypeError) as e:
-                logger.warning(f"Kiwi split_into_sents 실패: {e}")
-                # Method 2: 다른 Kiwi 메서드 시도
-                try:
-                    # 일부 버전에서는 다른 메서드명 사용
-                    if hasattr(self.kiwi, 'split_sents'):
-                        split_result = self.kiwi.split_sents(text)
-                        sentences = [sent.strip() for sent in split_result if sent.strip()]
-                    else:
-                        raise AttributeError("Kiwi 문장 분리 메서드를 찾을 수 없음")
-                
-                except Exception:
-                    # Method 3: 정규식 기반 폴백
-                    sentences = self._split_sentences_with_regex(text)
-            
-        except Exception as e:
-            logger.warning(f"Kiwi 문장 분리 실패: {e}")
-            # 폴백: 정규식 기반 문장 분리
-            sentences = self._split_sentences_with_regex(text)
-        
-        # 결과 검증 및 정리
-        cleaned_sentences = []
-        for sent in sentences:
-            if sent and len(sent.strip()) > 5:  # 최소 길이 체크
-                cleaned_sentences.append(sent.strip())
-        
-        return cleaned_sentences if cleaned_sentences else [text]  # 최소한 원본 텍스트는 반환
-    
-    def _split_sentences_with_regex(self, text: str) -> List[str]:
-        """정규식 기반 문장 분리 (폴백 메서드)"""
-        # 한국어 문장 분리 패턴
-        sentence_patterns = [
-            r'[.!?]+\s+',           # 일반적인 문장 종료
-            r'[.!?]+$',             # 문장 끝
-            r'[.]\s*\n',            # 줄바꿈과 함께 끝나는 문장
-            r'[다요음니까]\.\s*',   # 한국어 어미 + 마침표
-        ]
-        
-        sentences = [text]  # 시작은 전체 텍스트
-        
-        for pattern in sentence_patterns:
-            new_sentences = []
-            for sent in sentences:
-                split_sents = re.split(pattern, sent)
-                new_sentences.extend([s.strip() for s in split_sents if s.strip()])
-            sentences = new_sentences
-        
-        return [sent for sent in sentences if len(sent) > 5]
-    
-    def _integrate_keywords(self, morph_keywords: List[str], semantic_keywords: List[str], 
-                          tfidf_keywords: List[str]) -> List[str]:
-        """여러 방법으로 추출된 키워드들을 통합하고 중요도 순으로 정렬"""
-        keyword_scores = {}
-        
-        # 형태소 분석 키워드 (기본 점수 1.0)
-        for keyword in morph_keywords:
-            keyword_scores[keyword] = keyword_scores.get(keyword, 0) + 1.0
-        
-        # 의미적 확장 키워드 (점수 0.8)
-        for keyword in semantic_keywords:
-            keyword_scores[keyword] = keyword_scores.get(keyword, 0) + 0.8
-        
-        # TF-IDF 키워드 (점수 0.6)
-        for keyword in tfidf_keywords:
-            keyword_scores[keyword] = keyword_scores.get(keyword, 0) + 0.6
-        
-        # 점수 순으로 정렬
-        sorted_keywords = sorted(keyword_scores.items(), key=lambda x: x[1], reverse=True)
-        
-        return [keyword for keyword, score in sorted_keywords if score >= 0.5]
-    
-    def _categorize_keywords(self, keywords: List[str]) -> Dict[str, int]:
-        """키워드들을 카테고리별로 분류"""
-        categories = {category: 0 for category in self.seed_keywords.keys()}
-        
-        for keyword in keywords:
-            for category, seed_words in self.seed_keywords.items():
-                if keyword in seed_words or any(seed in keyword for seed in seed_words):
-                    categories[category] += 1
-                    break
-        
-        return categories
+# DomainDetector와 AdaptiveKeywordExtractor는 adaptive_rag_components에서 import
 
 class AnswerGenerator:
     """답변 생성 LLM 클래스"""
@@ -1148,7 +692,7 @@ class AnswerGenerator:
         if not hasattr(self, 'keyword_extractor'):
             # 첫 번째 호출 시 키워드 추출기 초기화
             embedding_model = EmbeddingModel()
-            self.keyword_extractor = AdvancedKeywordExtractor(embedding_model)
+            self.keyword_extractor = AdaptiveKeywordExtractor(embedding_model)
         
         # 고급 키워드 추출 수행
         extraction_result = self.keyword_extractor.extract_keywords(query, context)
@@ -1799,7 +1343,7 @@ class DocumentLoader:
         return documents
 
 class RAGSystem:
-    """통합 RAG 시스템 클래스"""
+    """개선된 RAG 시스템 클래스 - 적응형 컴포넌트 통합"""
     
     def __init__(self):
         self.embedding_model = EmbeddingModel()
@@ -1807,20 +1351,44 @@ class RAGSystem:
         self.answer_generator = AnswerGenerator()
         self.vector_store = VectorStore()
         
+        # 새로운 적응형 컴포넌트들 초기화
+        self.adaptive_keyword_extractor = AdaptiveKeywordExtractor(self.embedding_model)
+        self.adaptive_weight_calculator = AdaptiveWeightCalculator()
+        self.smart_threshold_calculator = SmartThresholdCalculator()
+        self.flywheel_metrics = FlyWheelMetricsCollector()
+        self.domain_detector = DomainDetector()
+        
+        logger.info("개선된 RAG 시스템 초기화 완료 (적응형 컴포넌트 포함)")
+        
     def search_and_answer(self, query: str, top_k: int = 5) -> Dict[str, Any]:
-        """질문에 대해 검색하고 답변을 생성합니다."""
+        """개선된 질문 처리: 도메인 감지 + 적응형 키워드 + 스마트 임계값"""
         try:
-            # 1. 쿼리 임베딩
+            # 1. 도메인 자동 감지
+            detected_domain = self.domain_detector.detect_domain(query)
+            logger.debug(f"감지된 도메인: {detected_domain}")
+            
+            # 2. 적응형 키워드 추출
+            keyword_result = self.adaptive_keyword_extractor.extract_keywords_adaptive(
+                query, domain=detected_domain
+            )
+            logger.debug(f"추출된 키워드: {keyword_result['final_keywords']}")
+            
+            # 3. 쿼리 임베딩
             query_embedding = self.embedding_model.encode([query])
             
-            # 2. 벡터 검색 (analysis와 image_summary만)
+            # 4. 벡터 검색 (analysis와 image_summary만)
             search_results = self.vector_store.search(
                 query_embedding[0], 
                 top_k=Config.TOP_K_RETRIEVAL
             )
             
-            # 3. 문서 연관성 판단 (동적 임계값 + 키워드 보정)
-            has_relevant_docs = self._check_document_relevance(search_results, query)
+            # 5. 스마트 임계값으로 문서 연관성 판단
+            smart_threshold = self.smart_threshold_calculator.calculate_smart_threshold(
+                query, search_results, detected_domain
+            )
+            has_relevant_docs = self._check_document_relevance_enhanced(
+                search_results, query, smart_threshold, keyword_result
+            )
             
             if not search_results or not has_relevant_docs:
                 # 문서와 연관 없는 질문 처리
@@ -1863,26 +1431,32 @@ class RAGSystem:
                 query, context, sources=sources, has_relevant_docs=True
             )
             
-            # 9. 개선된 신뢰도 계산
+            # 9. 적응형 가중치로 개선된 신뢰도 계산
             if reranked_indices:
+                # 적응형 가중치 계산
+                vector_weight, rerank_weight = self.adaptive_weight_calculator.calculate_adaptive_weights(
+                    query, search_results, detected_domain
+                )
+                
                 # 리랭킹 점수들을 정규화하여 0-1 범위로 변환
                 rerank_scores = [abs(float(score)) for _, score in reranked_indices]
                 vector_scores = [float(sources[i]["vector_score"]) for i in range(len(sources))]
                 
                 # 벡터 유사도와 리랭킹 점수를 결합
-                # 벡터 점수는 이미 0-1 범위, 리랭킹 점수는 정규화
                 if rerank_scores:
                     max_rerank = max(rerank_scores) if max(rerank_scores) > 0 else 1.0
                     normalized_rerank = [score / max_rerank for score in rerank_scores]
                     
-                    # 가중 평균 계산 (벡터 유사도 60%, 리랭킹 40%)
+                    # 적응형 가중 평균 계산
                     combined_scores = []
                     for i, (vec_score, rerank_score) in enumerate(zip(vector_scores, normalized_rerank)):
-                        combined_score = (vec_score * 0.6) + (rerank_score * 0.4)
+                        combined_score = (vec_score * vector_weight) + (rerank_score * rerank_weight)
                         combined_scores.append(combined_score)
                     
                     # 상위 결과들의 평균을 신뢰도로 사용
                     confidence = np.mean(combined_scores[:3])  # 상위 3개 평균
+                    
+                    logger.debug(f"적응형 신뢰도: {confidence:.3f} (벡터 {vector_weight:.2f}, 리랭킹 {rerank_weight:.2f})")
                 else:
                     confidence = np.mean(vector_scores[:3])  # 벡터 점수만 사용
             else:
@@ -1891,13 +1465,26 @@ class RAGSystem:
             # 신뢰도를 0-1 범위로 제한
             confidence = max(0.0, min(1.0, float(confidence)))
             
-            return {
+            # 10. 플라이휠 메트릭 수집
+            result = {
                 "answer": answer,
                 "sources": sources,
                 "confidence": confidence,
                 "query_analysis": query_analysis,
-                "related_questions": related_questions
+                "related_questions": related_questions,
+                "domain": detected_domain,
+                "keywords": keyword_result['final_keywords'],
+                "adaptive_weights": {
+                    "vector": vector_weight if 'vector_weight' in locals() else 0.6,
+                    "rerank": rerank_weight if 'rerank_weight' in locals() else 0.4
+                },
+                "smart_threshold": smart_threshold if 'smart_threshold' in locals() else 0.45
             }
+            
+            # 성능 메트릭 기록
+            self.flywheel_metrics.record_query_performance(query, result)
+            
+            return result
             
         except Exception as e:
             logger.error(f"검색 및 답변 생성 실패: {e}")
@@ -1958,6 +1545,95 @@ class RAGSystem:
                    f"동적 임계값: {dynamic_threshold:.3f}, 키워드 매칭: {keyword_match_rate:.3f}, "
                    f"보정(키워드: +{keyword_boost:.3f}, 의미: +{semantic_boost:.3f})")
         return True
+    
+    def _check_document_relevance_enhanced(self, search_results: List[Dict], query: str, 
+                                         smart_threshold: float, keyword_result: Dict) -> bool:
+        """개선된 문서 연관성 판단 - 스마트 임계값 + 적응형 키워드 사용"""
+        if not search_results:
+            return False
+        
+        # 기본 점수 계산
+        max_score = max(result["score"] for result in search_results)
+        top_scores = [result["score"] for result in search_results[:3]]
+        avg_score = np.mean(top_scores)
+        
+        # 적응형 키워드를 이용한 키워드 매칭 보정
+        extracted_keywords = keyword_result.get('final_keywords', [])
+        keyword_boost = self._calculate_keyword_boost_enhanced(extracted_keywords, search_results)
+        
+        # 의미적 유사도 보정 계산 (기존 로직 재사용)
+        semantic_boost = self._calculate_semantic_boost(query, search_results)
+        
+        # 종합 보정값 계산
+        total_boost = keyword_boost + semantic_boost
+        
+        # 보정된 점수 계산
+        adjusted_max_score = max_score + total_boost
+        adjusted_avg_score = avg_score + total_boost
+        
+        # 스마트 임계값 사용
+        smart_avg_threshold = smart_threshold * 0.8
+        
+        # 1. 최고 점수 검증
+        if adjusted_max_score < smart_threshold:
+            logger.info(f"스마트 임계값 미달: 최고 점수 {adjusted_max_score:.3f} < {smart_threshold:.3f}")
+            return False
+        
+        # 2. 평균 점수 검증
+        if adjusted_avg_score < smart_avg_threshold:
+            logger.info(f"스마트 평균 임계값 미달: 평균 점수 {adjusted_avg_score:.3f} < {smart_avg_threshold:.3f}")
+            return False
+        
+        # 3. 키워드 매칭률 검증 (적응형 키워드 사용)
+        keyword_match_rate = self._calculate_keyword_match_rate_enhanced(extracted_keywords, search_results)
+        if keyword_match_rate < 0.1 and adjusted_max_score < 0.6:
+            logger.info(f"키워드 매칭률 부족: {keyword_match_rate:.3f} (점수: {adjusted_max_score:.3f})")
+            return False
+        
+        logger.info(f"스마트 문서 연관성 확인됨 - 최고: {adjusted_max_score:.3f}, 평균: {adjusted_avg_score:.3f}, "
+                   f"스마트 임계값: {smart_threshold:.3f}, 키워드 매칭: {keyword_match_rate:.3f}, "
+                   f"키워드 수: {len(extracted_keywords)}, 보정: +{total_boost:.3f}")
+        return True
+    
+    def _calculate_keyword_boost_enhanced(self, keywords: List[str], search_results: List[Dict]) -> float:
+        """적응형 키워드를 사용한 향상된 키워드 부스트 계산"""
+        if not keywords or not search_results:
+            return 0.0
+        
+        # 검색된 문서들에서 키워드 매칭 정도 계산
+        total_matches = 0
+        total_keywords = len(keywords)
+        
+        for result in search_results[:3]:  # 상위 3개 문서만 확인
+            content = result.get("content", "").lower()
+            matches = sum(1 for keyword in keywords if keyword.lower() in content)
+            total_matches += matches
+        
+        # 매칭률 계산
+        match_rate = total_matches / (total_keywords * 3) if total_keywords > 0 else 0.0
+        
+        # 보정값 계산 (최대 0.2까지 - 기존보다 강화)
+        keyword_boost = min(0.2, match_rate * 0.4)
+        
+        logger.debug(f"향상된 키워드 보정: {keywords[:5]} → 매칭률 {match_rate:.3f} → 보정 +{keyword_boost:.3f}")
+        
+        return keyword_boost
+    
+    def _calculate_keyword_match_rate_enhanced(self, keywords: List[str], search_results: List[Dict]) -> float:
+        """적응형 키워드를 사용한 향상된 키워드 매칭률 계산"""
+        if not keywords or not search_results:
+            return 0.0
+        
+        # 상위 문서들에서 키워드 매칭 확인
+        matched_keywords = set()
+        for result in search_results[:5]:
+            content = result.get("content", "").lower()
+            for keyword in keywords:
+                if keyword.lower() in content:
+                    matched_keywords.add(keyword)
+        
+        match_rate = len(matched_keywords) / len(keywords)
+        return match_rate
     
     def _calculate_dynamic_threshold(self, query: str, search_results: List[Dict]) -> float:
         """
